@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "unity": {
+      "command": "npx",
+      "args": ["-y", "unity-mcp-server"],
+      "env": {
+        "UNITY_PROJECT_PATH": "a:\\Unity\\Unity Projects\\SniperLoop\\SniperLoop\\SniperLoop"
+      }
+    }
+  }
+}
