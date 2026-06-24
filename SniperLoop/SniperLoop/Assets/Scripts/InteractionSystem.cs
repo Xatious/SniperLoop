@@ -1,15 +1,19 @@
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
-// Core interaction system for first-person object pickup, hold, rotate, and drop.
-// Goes on the Main Camera. Uses physics-based holding (spring-damper forces)
-// so held objects sway naturally rather than snapping rigidly to a point.
+// Two-handed interaction system. Left click = left hand, right click = right hand.
+// Each hand independently holds objects with physics-based spring forces.
+// Both hands on the same object = two-handed grip (stable, rotatable).
+// Context menu (scroll wheel) shows available actions on looked-at objects.
 public class InteractionSystem : MonoBehaviour
 {
     [Header("Input")]
-    [SerializeField] private InputActionReference attackAction;
-    [SerializeField] private InputActionReference rotateAction;
+    [SerializeField] private InputActionReference leftClickAction;
+    [SerializeField] private InputActionReference rightClickAction;
+    [SerializeField] private InputActionReference scrollAction;
     [SerializeField] private InputActionReference lookAction;
+    [SerializeField] private InputActionReference freezeAction;
 
     [Header("Raycast")]
     [SerializeField] private float interactRange = 2f;
@@ -20,25 +24,43 @@ public class InteractionSystem : MonoBehaviour
     [SerializeField] private float defaultDamping = 10f;
     [SerializeField] private float defaultHoldDistance = 1.5f;
     [SerializeField] private float maxHoldSpeed = 10f;
+    // Horizontal offset when carrying two separate objects so they don't overlap
+    [SerializeField] private float twoItemSpread = 0.3f;
 
-    [Header("Rotation")]
+    [Header("Grip")]
+    [SerializeField] private float gripStrength = 5f;
+
+    [Header("Rotation (Two-Handed)")]
     [SerializeField] private float rotationSensitivity = 1f;
 
     [Header("UI")]
     [SerializeField] private CrosshairUI crosshairUI;
 
+    // Per-hand state — each hand tracks its own held object independently
+    private class HandState
+    {
+        public Rigidbody heldRB;
+        public Interactable heldInteractable;
+        public MountPointOut heldMountOut;
+        public Vector3 grabLocalPoint;
+        public bool wasGravity;
+
+        public bool IsHolding => heldRB != null;
+    }
+
+    private HandState leftHand = new HandState();
+    private HandState rightHand = new HandState();
+
     private Camera playerCamera;
-    private Rigidbody heldRigidbody;
-    private Interactable heldInteractable;
     private Interactable lookedAtInteractable;
-    private bool wasGravity;
+    private List<InteractionAction> currentActions = new List<InteractionAction>();
 
-    // Other scripts (MouseLook) check this to know when to freeze camera rotation.
-    public bool IsRotating { get; private set; }
-
-    // Tracks whether we're holding something — useful for other systems
-    // (e.g. PlayerShooting can check this to prevent firing while carrying).
-    public bool IsHoldingObject => heldRigidbody != null;
+    // True when both hands hold the same object — camera freezes for rotation.
+    public bool IsTwoHanding { get; private set; }
+    // True when R is held with a one-handed object — freezes object in space
+    // so the player can look at a specific spot for their second hand.
+    public bool IsFreezing { get; private set; }
+    public bool IsHoldingAnything => leftHand.IsHolding || rightHand.IsHolding;
 
     void Start()
     {
@@ -47,197 +69,331 @@ public class InteractionSystem : MonoBehaviour
 
     void OnEnable()
     {
-        attackAction?.action.Enable();
-        rotateAction?.action.Enable();
+        leftClickAction?.action.Enable();
+        rightClickAction?.action.Enable();
+        scrollAction?.action.Enable();
         lookAction?.action.Enable();
+        freezeAction?.action.Enable();
     }
 
     void OnDisable()
     {
-        attackAction?.action.Disable();
-        rotateAction?.action.Disable();
+        leftClickAction?.action.Disable();
+        rightClickAction?.action.Disable();
+        scrollAction?.action.Disable();
         lookAction?.action.Disable();
+        freezeAction?.action.Disable();
 
-        if (heldRigidbody != null)
-            Drop();
+        if (leftHand.IsHolding) DropHand(leftHand);
+        if (rightHand.IsHolding) DropHand(rightHand);
     }
 
     void Update()
     {
         // --- RAYCAST DETECTION ---
-        // Cast a ray from the exact center of the camera (where the crosshair dot is)
-        // forward into the scene. This is how we "look at" objects.
-        // Physics.Raycast returns true if it hits something within range.
         Ray ray = new Ray(playerCamera.transform.position, playerCamera.transform.forward);
+        RaycastHit hit = default;
+        bool didHit = Physics.Raycast(ray, out hit, interactRange, interactableLayers);
 
-        if (Physics.Raycast(ray, out RaycastHit hit, interactRange, interactableLayers))
+        if (didHit)
         {
-            // GetComponentInParent walks up the hierarchy — useful when the collider
-            // is on a child object but the Interactable component is on the parent.
             var interactable = hit.collider.GetComponentInParent<Interactable>();
+            if (interactable != null && interactable != lookedAtInteractable)
+            {
+                // Hide the previous object's menu
+                lookedAtInteractable?.HideMenu();
 
-            if (interactable != null && heldRigidbody == null)
-            {
                 lookedAtInteractable = interactable;
-                crosshairUI?.ShowItemName(interactable.ItemName);
-            }
-            else if (heldRigidbody == null)
-            {
-                ClearLookedAt();
+                currentActions = interactable.GetActions(this);
+                interactable.ShowMenu(currentActions);
+                crosshairUI?.SetInteractableMode(true);
             }
         }
-        else if (heldRigidbody == null)
+        else if (lookedAtInteractable != null && !IsTwoHanding)
         {
             ClearLookedAt();
         }
 
-        // --- PICKUP ---
-        bool attackPressed = attackAction?.action.WasPressedThisFrame() ?? false;
-        if (attackPressed && heldRigidbody == null && lookedAtInteractable != null)
+        // --- SCROLL WHEEL ---
+        Vector2 scroll = scrollAction?.action.ReadValue<Vector2>() ?? Vector2.zero;
+        if (scroll.y > 0.1f)
+            lookedAtInteractable?.ScrollMenu(-1);
+        else if (scroll.y < -0.1f)
+            lookedAtInteractable?.ScrollMenu(1);
+
+        // --- SNAP POINT PREVIEW (for whichever hand is holding a snappable object) ---
+        UpdateSnapPreview(leftHand);
+        UpdateSnapPreview(rightHand);
+
+        // --- LEFT CLICK ---
+        bool leftPressed = leftClickAction?.action.WasPressedThisFrame() ?? false;
+        bool leftHeld = leftClickAction?.action.IsPressed() ?? false;
+
+        if (leftPressed && !leftHand.IsHolding)
         {
-            Pickup(lookedAtInteractable);
+            ExecuteSelectedAction(HandSide.Left, hit);
+        }
+        else if (leftHand.IsHolding && !leftHeld)
+        {
+            DropFromHand(leftHand);
         }
 
-        // --- DROP ---
-        bool attackHeld = attackAction?.action.IsPressed() ?? false;
-        if (heldRigidbody != null && !attackHeld)
+        // --- RIGHT CLICK ---
+        bool rightPressed = rightClickAction?.action.WasPressedThisFrame() ?? false;
+        bool rightHeld = rightClickAction?.action.IsPressed() ?? false;
+
+        if (rightPressed && !rightHand.IsHolding)
         {
-            Drop();
+            ExecuteSelectedAction(HandSide.Right, hit);
+        }
+        else if (rightHand.IsHolding && !rightHeld)
+        {
+            DropFromHand(rightHand);
         }
 
-        // --- ROTATE MODE ---
-        // When holding R with an object, mouse movement rotates the object
-        // instead of the camera. MouseLook checks IsRotating to freeze.
-        if (heldRigidbody != null && (rotateAction?.action.IsPressed() ?? false))
-        {
-            IsRotating = true;
+        // --- FREEZE MODE (R key) ---
+        // Hold R while one-handing an object to freeze it in space.
+        // This lets you look around freely to find a spot for your second hand.
+        // The object goes kinematic (no physics) and stays put while you aim.
+        bool freezeHeld = freezeAction?.action.IsPressed() ?? false;
+        bool onlyOneHand = (leftHand.IsHolding ^ rightHand.IsHolding);
 
+        if (freezeHeld && onlyOneHand && !IsTwoHanding)
+        {
+            var activeHand = leftHand.IsHolding ? leftHand : rightHand;
+            if (!IsFreezing)
+            {
+                activeHand.heldRB.isKinematic = true;
+                activeHand.heldRB.linearVelocity = Vector3.zero;
+                activeHand.heldRB.angularVelocity = Vector3.zero;
+                IsFreezing = true;
+            }
+        }
+        else if (IsFreezing)
+        {
+            // Unfreeze — restore physics on whichever hand was holding
+            var activeHand = leftHand.IsHolding ? leftHand : rightHand;
+            if (activeHand.IsHolding && activeHand.heldRB.isKinematic)
+            {
+                activeHand.heldRB.isKinematic = false;
+                activeHand.heldRB.linearVelocity = Vector3.zero;
+                activeHand.heldRB.angularVelocity = Vector3.zero;
+            }
+            IsFreezing = false;
+        }
+
+        // --- TWO-HANDED DETECTION ---
+        bool wasTwoHanding = IsTwoHanding;
+        IsTwoHanding = leftHand.IsHolding && rightHand.IsHolding
+                     && leftHand.heldRB == rightHand.heldRB;
+
+        // --- TWO-HANDED ROTATION ---
+        if (IsTwoHanding)
+        {
             Vector2 mouseDelta = lookAction?.action.ReadValue<Vector2>() ?? Vector2.zero;
+            if (mouseDelta.sqrMagnitude > 0.01f)
+            {
+                float rotX = -mouseDelta.y * rotationSensitivity;
+                float rotY = mouseDelta.x * rotationSensitivity;
 
-            // Mouse X rotates around the world Y axis (spin left/right).
-            // Mouse Y rotates around the camera's right axis (tilt forward/back).
-            // This feels intuitive: moving the mouse left spins the object left.
-            float rotX = -mouseDelta.y * rotationSensitivity;
-            float rotY = mouseDelta.x * rotationSensitivity;
-
-            // MoveRotation is the physics-safe way to rotate a Rigidbody.
-            // Direct transform.rotation changes can cause physics glitches.
-            Quaternion deltaRotation = Quaternion.Euler(
-                playerCamera.transform.right * rotX +
-                Vector3.up * rotY
-            );
-
-            // Build rotation incrementally from current rotation
-            Quaternion yaw = Quaternion.AngleAxis(rotY, Vector3.up);
-            Quaternion pitch = Quaternion.AngleAxis(rotX, playerCamera.transform.right);
-            heldRigidbody.MoveRotation(pitch * yaw * heldRigidbody.rotation);
-        }
-        else
-        {
-            IsRotating = false;
+                Quaternion yaw = Quaternion.AngleAxis(rotY, Vector3.up);
+                Quaternion pitch = Quaternion.AngleAxis(rotX, playerCamera.transform.right);
+                leftHand.heldRB.MoveRotation(pitch * yaw * leftHand.heldRB.rotation);
+            }
         }
     }
 
     void FixedUpdate()
     {
-        if (heldRigidbody == null) return;
+        // Skip spring forces while frozen — object is kinematic, stays in place
+        if (IsFreezing) return;
 
-        // --- SPRING-DAMPER PHYSICS ---
-        // This is the core of the physics hold. Instead of teleporting the object
-        // to a fixed point (which ignores collisions), we apply forces that PULL
-        // it toward the target. This creates the natural sway/lag effect.
+        if (IsTwoHanding)
+        {
+            // Two-handed: both springs pull the same object from different points.
+            // This naturally stabilizes it — no droop, no tilt.
+            ApplyHoldForces(leftHand, Vector3.zero);
+            ApplyHoldForces(rightHand, Vector3.zero);
+        }
+        else
+        {
+            // Offset left/right when carrying two separate objects
+            Vector3 leftOffset = rightHand.IsHolding ? -playerCamera.transform.right * twoItemSpread : Vector3.zero;
+            Vector3 rightOffset = leftHand.IsHolding ? playerCamera.transform.right * twoItemSpread : Vector3.zero;
 
-        float holdDist = (heldInteractable != null && heldInteractable.HoldDistance > 0)
-            ? heldInteractable.HoldDistance
+            if (leftHand.IsHolding)
+                ApplyHoldForces(leftHand, leftOffset);
+            if (rightHand.IsHolding)
+                ApplyHoldForces(rightHand, rightOffset);
+        }
+    }
+
+    void ApplyHoldForces(HandState hand, Vector3 positionOffset)
+    {
+        if (!hand.IsHolding) return;
+
+        float holdDist = (hand.heldInteractable != null && hand.heldInteractable.HoldDistance > 0)
+            ? hand.heldInteractable.HoldDistance
             : defaultHoldDistance;
 
-        // Target position: a point floating in front of the camera
         Vector3 targetPos = playerCamera.transform.position
-                          + playerCamera.transform.forward * holdDist;
+                          + playerCamera.transform.forward * holdDist
+                          + positionOffset;
 
-        // Displacement: how far the object is from where it should be
-        Vector3 displacement = targetPos - heldRigidbody.position;
+        Vector3 currentGrabPos = hand.heldRB.transform.TransformPoint(hand.grabLocalPoint);
+        Vector3 displacement = targetPos - currentGrabPos;
 
-        // Safety check: if the object got stuck behind geometry and is too far away,
-        // force-drop it rather than yanking it through walls.
         if (displacement.magnitude > interactRange * 2f)
         {
-            Drop();
+            DropHand(hand);
             return;
         }
 
-        // Spring force (Hooke's Law): F = k * x
-        // The further from the target, the stronger the pull.
-        float k = (heldInteractable != null && heldInteractable.SpringForce > 0)
-            ? heldInteractable.SpringForce
+        float k = (hand.heldInteractable != null && hand.heldInteractable.SpringForce > 0)
+            ? hand.heldInteractable.SpringForce
             : defaultSpringForce;
+        if (IsTwoHanding) k *= 1.5f;
         Vector3 springForce = displacement * k;
 
-        // Damping force: F = -c * v
-        // Opposes current velocity to prevent oscillation (bouncing back and forth).
-        // Without this, the object would overshoot the target and swing like a pendulum.
-        float c = (heldInteractable != null && heldInteractable.Damping > 0)
-            ? heldInteractable.Damping
+        float c = (hand.heldInteractable != null && hand.heldInteractable.Damping > 0)
+            ? hand.heldInteractable.Damping
             : defaultDamping;
-        Vector3 dampingForce = -heldRigidbody.linearVelocity * c;
+        Vector3 dampingForce = -hand.heldRB.linearVelocity * c;
 
-        heldRigidbody.AddForce(springForce + dampingForce, ForceMode.Force);
+        Vector3 grabWorldPoint = hand.heldRB.transform.TransformPoint(hand.grabLocalPoint);
+        hand.heldRB.AddForceAtPosition(springForce + dampingForce, grabWorldPoint, ForceMode.Force);
 
-        // Clamp velocity so the object can't shoot through walls when the player
-        // whips the camera around. It'll lag behind instead — which looks natural.
-        if (heldRigidbody.linearVelocity.magnitude > maxHoldSpeed)
-            heldRigidbody.linearVelocity = heldRigidbody.linearVelocity.normalized * maxHoldSpeed;
+        if (hand.heldRB.linearVelocity.magnitude > maxHoldSpeed)
+            hand.heldRB.linearVelocity = hand.heldRB.linearVelocity.normalized * maxHoldSpeed;
 
-        // Gradually reduce spinning — but only when NOT in rotate mode,
-        // otherwise it fights the player's intentional rotation input.
-        if (!IsRotating)
-            heldRigidbody.angularVelocity *= 0.9f;
+        // Grip torque — fights gravity tilt. Stronger when two-handing.
+        if (gripStrength > 0f && !IsTwoHanding)
+        {
+            Vector3 currentUp = hand.heldRB.transform.up;
+            Vector3 torqueAxis = Vector3.Cross(currentUp, Vector3.up);
+            hand.heldRB.AddTorque(torqueAxis * gripStrength, ForceMode.Acceleration);
+        }
+
+        if (!IsTwoHanding)
+            hand.heldRB.angularVelocity *= 0.85f;
     }
 
-    void Pickup(Interactable target)
+    // Called by Interactable.GetActions — this is the public pickup entry point.
+    public void PickupWithHand(HandSide side, Interactable target)
     {
+        // Can't pick up if that hand is already holding something
+        var hand = side == HandSide.Left ? leftHand : rightHand;
+        if (hand.IsHolding) return;
+
         var rb = target.GetComponent<Rigidbody>();
         if (rb == null) return;
 
-        heldRigidbody = rb;
-        heldInteractable = target;
+        // Unsnap if mounted
+        var mountOut = target.GetComponentInChildren<MountPointOut>();
+        if (mountOut != null && mountOut.IsSnapped)
+            mountOut.Unsnap();
 
-        // Save and disable gravity so the object floats while held
-        wasGravity = rb.useGravity;
-        rb.useGravity = false;
+        // If kinematic (was snapped), restore to dynamic
+        if (rb.isKinematic)
+            rb.isKinematic = false;
 
-        // Interpolation smooths the visual position between physics frames.
-        // Without it, the held object jitters because FixedUpdate runs at a
-        // different rate than the render loop.
+        hand.heldRB = rb;
+        hand.heldInteractable = target;
+        hand.heldMountOut = mountOut;
+        hand.wasGravity = rb.useGravity;
+
+        // Find the grab point from a raycast at the object
+        Ray ray = new Ray(playerCamera.transform.position, playerCamera.transform.forward);
+        var cols = rb.GetComponentsInChildren<Collider>();
+        bool foundGrab = false;
+        foreach (var col in cols)
+        {
+            if (col.Raycast(ray, out RaycastHit grabHit, interactRange * 2f))
+            {
+                hand.grabLocalPoint = rb.transform.InverseTransformPoint(grabHit.point);
+                foundGrab = true;
+                break;
+            }
+        }
+        if (!foundGrab)
+            hand.grabLocalPoint = Vector3.zero;
+
         rb.interpolation = RigidbodyInterpolation.Interpolate;
-
-        // Continuous collision detection prevents fast-moving objects from
-        // tunneling through thin walls (checks collision along the path, not just at endpoints).
         rb.collisionDetectionMode = CollisionDetectionMode.Continuous;
-
-        // Kill any existing spin so the object doesn't whirl when grabbed
         rb.angularVelocity = Vector3.zero;
 
         ClearLookedAt();
     }
 
-    void Drop()
+    void DropFromHand(HandState hand)
     {
-        // Re-enable gravity — the object falls naturally from here.
-        // It keeps whatever velocity it had, so if you were moving,
-        // it gets tossed in that direction. Physics drop.
-        heldRigidbody.useGravity = wasGravity;
-        heldRigidbody.interpolation = RigidbodyInterpolation.None;
-        heldRigidbody.collisionDetectionMode = CollisionDetectionMode.Discrete;
+        if (!hand.IsHolding) return;
 
-        heldRigidbody = null;
-        heldInteractable = null;
-        IsRotating = false;
+        // Check for snap point before normal drop
+        if (hand.heldMountOut != null)
+        {
+            var nearestMount = hand.heldMountOut.FindNearestMountIn(interactRange);
+            if (nearestMount != null)
+            {
+                hand.heldMountOut.HideGhostPreview();
+                hand.heldMountOut.Snap(nearestMount);
+                ClearHandState(hand);
+                return;
+            }
+        }
+
+        DropHand(hand);
+    }
+
+    void DropHand(HandState hand)
+    {
+        if (!hand.IsHolding) return;
+
+        hand.heldMountOut?.HideGhostPreview();
+
+        if (hand.heldRB.isKinematic)
+            hand.heldRB.isKinematic = false;
+
+        hand.heldRB.useGravity = hand.wasGravity;
+        hand.heldRB.interpolation = RigidbodyInterpolation.None;
+        hand.heldRB.collisionDetectionMode = CollisionDetectionMode.Discrete;
+
+        ClearHandState(hand);
+    }
+
+    void ClearHandState(HandState hand)
+    {
+        hand.heldRB = null;
+        hand.heldInteractable = null;
+        hand.heldMountOut = null;
+        hand.grabLocalPoint = Vector3.zero;
+    }
+
+    void ExecuteSelectedAction(HandSide side, RaycastHit hit)
+    {
+        if (lookedAtInteractable == null) return;
+        int index = lookedAtInteractable.GetSelectedIndex();
+        if (index >= 0 && index < currentActions.Count)
+        {
+            currentActions[index].Execute(side);
+        }
+    }
+
+    void UpdateSnapPreview(HandState hand)
+    {
+        if (!hand.IsHolding || hand.heldMountOut == null) return;
+        var nearestMount = hand.heldMountOut.FindNearestMountIn(interactRange);
+        if (nearestMount != null)
+            hand.heldMountOut.ShowGhostPreview(nearestMount);
+        else
+            hand.heldMountOut.HideGhostPreview();
     }
 
     void ClearLookedAt()
     {
+        lookedAtInteractable?.HideMenu();
         lookedAtInteractable = null;
-        crosshairUI?.HideItemName();
+        currentActions.Clear();
+        crosshairUI?.SetInteractableMode(false);
     }
 }

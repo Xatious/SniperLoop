@@ -1,35 +1,20 @@
 using UnityEngine;
 using UnityEngine.UI;
-using TMPro;
 
-// Manages the crosshair dot and item name display.
-// This is purely visual — no gameplay logic lives here.
-// The InteractionSystem calls ShowItemName/HideItemName to control it.
+// Manages the crosshair dot in the center of the screen.
+// The dot changes color when looking at an interactable object.
+// The actual action menu is now on each Interactable's world-space canvas.
 public class CrosshairUI : MonoBehaviour
 {
     [SerializeField] private Image crosshairDot;
-    [SerializeField] private TMP_Text itemNameText;
 
     [Header("Colors")]
-    [SerializeField] private Color defaultColor = Color.white;
-    [SerializeField] private Color interactableColor = Color.green;
+    [SerializeField] private Color defaultDotColor = Color.white;
+    [SerializeField] private Color interactableDotColor = Color.green;
 
-    void Start()
+    public void SetInteractableMode(bool looking)
     {
-        HideItemName();
-    }
-
-    public void ShowItemName(string name)
-    {
-        itemNameText.text = name;
-        itemNameText.enabled = true;
-        crosshairDot.color = interactableColor;
-    }
-
-    public void HideItemName()
-    {
-        itemNameText.text = "";
-        itemNameText.enabled = false;
-        crosshairDot.color = defaultColor;
+        if (crosshairDot != null)
+            crosshairDot.color = looking ? interactableDotColor : defaultDotColor;
     }
 }

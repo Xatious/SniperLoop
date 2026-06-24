@@ -44,9 +44,9 @@ public class MouseLook : MonoBehaviour
 
     void Update()
     {
-        // Skip camera rotation when the player is rotating a held object.
-        // The mouse delta goes to InteractionSystem instead.
-        if (interactionSystem != null && interactionSystem.IsRotating)
+        // Skip camera rotation when two-handing an object.
+        // Mouse input goes to InteractionSystem for rotation instead.
+        if (interactionSystem != null && interactionSystem.IsTwoHanding)
             return;
 
         Vector2 lookInput = lookAction?.action.ReadValue<Vector2>() ?? Vector2.zero;
